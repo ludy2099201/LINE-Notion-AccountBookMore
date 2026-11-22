@@ -1,5 +1,6 @@
 """Bookkeeper 流程測試：查重、撤銷、修正訊息、測試模式、多筆寫入。"""
 
+from datetime import datetime, timezone
 from unittest.mock import MagicMock
 
 import pytest
@@ -135,6 +136,33 @@ def test_redelivery_of_recorded_message_is_skipped(bookkeeper, notion):
     reply = bookkeeper.handle_text("/支 講義 4500", "Mia", is_redelivery=True)
     notion.create_account_entry.assert_not_called()
     assert "已經記錄過" in reply
+
+
+SENT_AT = datetime(2026, 11, 22, 7, 5, 40, tzinfo=timezone.utc)
+
+
+def test_redelivery_skips_entry_written_by_first_delivery(bookkeeper, notion):
+    notion.find_possible_duplicates.return_value = [{
+        "id": "p0", "title": "飲料", "recorder": "Mia", "amount": 75,
+        "created_time": "2026-11-22T07:05:00.000Z",     # Notion 只精確到分鐘
+    }]
+    reply = bookkeeper.handle_text("/支 飲料 75", "Mia", is_redelivery=True, event_time=SENT_AT)
+    notion.create_account_entry.assert_not_called()
+    assert "已經記錄過" in reply
+
+
+def test_redelivery_does_not_drop_legitimate_repeat(bookkeeper, notion):
+    """早上已記一筆「飲料 75」，下午又買一次；這則訊息第一次送達時沒寫成功。
+
+    帳本裡那筆是訊息送出前就存在的，不是這則訊息寫的，所以要照常寫入。
+    """
+    notion.find_possible_duplicates.return_value = [{
+        "id": "p0", "title": "飲料", "recorder": "Mia", "amount": 75,
+        "created_time": "2026-11-22T01:30:00.000Z",
+    }]
+    reply = bookkeeper.handle_text("/支 飲料 75", "Mia", is_redelivery=True, event_time=SENT_AT)
+    notion.create_account_entry.assert_called_once()
+    assert "可能重複" in reply and "已經記錄過" not in reply
 
 
 def test_redelivery_of_unrecorded_message_is_written(bookkeeper, notion):

@@ -167,7 +167,8 @@ class NotionAccountClient:
         """找出同一天、同金額、同收支類型的既有紀錄。
 
         Returns:
-            [{"id": page_id, "title": 摘要, "recorder": 記錄人}, ...]
+            [{"id": page_id, "title": 摘要, "recorder": 記錄人,
+              "amount": 金額, "created_time": Notion 建立時間}, ...]
         """
         payload = {
             "filter": {
@@ -226,6 +227,7 @@ class NotionAccountClient:
             "title": plain("摘要", "title"),
             "recorder": plain("記錄人", "rich_text"),
             "amount": props.get("金額", {}).get("number"),
+            "created_time": page.get("created_time", ""),
         }
 
     # ── HTTP ──────────────────────────────────────────────

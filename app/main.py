@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import threading
+from datetime import datetime, timezone
 
 from flask import Flask, abort, jsonify, request
 
@@ -97,11 +98,12 @@ def _process_event(event: dict) -> None:
 
         # LINE 在 webhook 逾時後會重送同一則事件；交給 Bookkeeper 判斷是否已記過
         is_redelivery = bool(event.get("deliveryContext", {}).get("isRedelivery"))
+        event_time = _event_time(event)
         # 一則訊息可能拆成多筆、每筆都要查重再寫入，放到背景執行，
         # 讓 webhook 立刻回 200，LINE 才不會因逾時重送而造成重複記帳。
         threading.Thread(
             target=_process_text_async,
-            args=(text, user_name, user_id, reply_token, is_redelivery),
+            args=(text, user_name, user_id, reply_token, is_redelivery, event_time),
             daemon=True,
         ).start()
         return
@@ -119,16 +121,27 @@ def _process_event(event: dict) -> None:
         ).start()
 
 
+def _event_time(event: dict) -> datetime | None:
+    """LINE 事件的 timestamp（毫秒）→ UTC 時間；沒有或格式不對回傳 None。"""
+    try:
+        return datetime.fromtimestamp(int(event["timestamp"]) / 1000, tz=timezone.utc)
+    except (KeyError, TypeError, ValueError, OverflowError, OSError):
+        return None
+
+
 def _process_text_async(
     text: str,
     user_name: str,
     user_id: str | None,
     reply_token: str | None,
     is_redelivery: bool,
+    event_time: datetime | None = None,
 ) -> None:
     """背景執行緒：解析 → 檢核 → 寫 Notion → 回覆。"""
     try:
-        reply = bookkeeper.handle_text(text, user_name, is_redelivery=is_redelivery)
+        reply = bookkeeper.handle_text(
+            text, user_name, is_redelivery=is_redelivery, event_time=event_time
+        )
     except Exception as exc:  # 背景執行緒的例外不會回到 webhook，這裡要自己回報
         logger.error("Error handling text message: %s", exc, exc_info=True)
         reply = "處理這則訊息時發生錯誤，沒有確認是否寫入。請到 Notion 檢查後再重傳。"

@@ -125,6 +125,7 @@ def test_schema_is_cached(client, monkeypatch):
 def test_find_possible_duplicates_filters_by_date_amount_type(client, monkeypatch):
     page = {
         "id": "p0",
+        "created_time": "2026-04-11T03:05:00.000Z",
         "properties": {
             "摘要": {"title": [{"plain_text": "Jennie Workshop 早鳥優惠價"}]},
             "記錄人": {"rich_text": [{"plain_text": "Mia"}]},
@@ -139,7 +140,10 @@ def test_find_possible_duplicates_filters_by_date_amount_type(client, monkeypatc
     assert {"property": "日期", "date": {"equals": "2026-04-11"}} in payload["filter"]["and"]
     assert {"property": "金額", "number": {"equals": 15300.0}} in payload["filter"]["and"]
     assert {"property": "收支類型", "select": {"equals": "收入"}} in payload["filter"]["and"]
-    assert found == [{"id": "p0", "title": "Jennie Workshop 早鳥優惠價", "recorder": "Mia", "amount": 15300}]
+    assert found == [{
+        "id": "p0", "title": "Jennie Workshop 早鳥優惠價", "recorder": "Mia",
+        "amount": 15300, "created_time": "2026-04-11T03:05:00.000Z",
+    }]
 
 
 def test_find_last_entry_by_limits_to_recorder_and_recent(client, monkeypatch):

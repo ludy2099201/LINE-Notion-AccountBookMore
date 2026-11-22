@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timezone
 from typing import Optional
 
 from app import ledger_rules
@@ -49,8 +50,21 @@ class Bookkeeper:
 
     # ── 文字訊息 ─────────────────────────────────────────
 
-    def handle_text(self, text: str, user_name: str, is_redelivery: bool = False) -> str:
-        """處理一則文字訊息，回傳要回覆給使用者的文字。"""
+    def handle_text(
+        self,
+        text: str,
+        user_name: str,
+        is_redelivery: bool = False,
+        event_time: Optional[datetime] = None,
+    ) -> str:
+        """處理一則文字訊息，回傳要回覆給使用者的文字。
+
+        Args:
+            is_redelivery: LINE 標示這則事件是重新送達。
+            event_time: 使用者送出訊息的時間（LINE 事件的 timestamp）。
+                重送時用來分辨「這則訊息第一次送達時寫入的紀錄」和
+                「更早以前另一筆內容相同的紀錄」。
+        """
         if ledger_rules.is_undo_command(text):
             if is_redelivery:
                 # 重送的「刪除上一筆」若再執行一次，會連前一筆也刪掉
@@ -85,7 +99,7 @@ class Bookkeeper:
                 self.processor.format_batch_confirmation(recordable, warnings, written=False)
             )
 
-        return self._record(recordable, warnings, user_name, is_redelivery)
+        return self._record(recordable, warnings, user_name, is_redelivery, event_time)
 
     # ── 圖片（OCR 結果）─────────────────────────────────
 
@@ -125,6 +139,7 @@ class Bookkeeper:
         warnings: list,
         user_name: str,
         is_redelivery: bool,
+        event_time: Optional[datetime] = None,
     ) -> str:
         written: list = []
         failures: list = []
@@ -135,6 +150,7 @@ class Bookkeeper:
             if is_redelivery and any(
                 ledger_rules.title_key(m["title"]) == ledger_rules.title_key(entry.title)
                 and m.get("recorder") == user_name
+                and self._created_since(m, event_time)
                 for m in matches
             ):
                 # LINE 重送同一則訊息，而且第一次其實已經寫進去了
@@ -193,6 +209,25 @@ class Bookkeeper:
             logger.warning("Duplicate check skipped: %s", exc)
             return []
         return [c for c in candidates if ledger_rules.titles_similar(c["title"], entry.title)]
+
+    @staticmethod
+    def _created_since(match: dict, event_time: Optional[datetime]) -> bool:
+        """這筆既有紀錄是不是在使用者送出訊息之後才建立的。
+
+        在訊息送出之前就存在的紀錄不可能是這則訊息寫的，那是另一筆
+        （例如同一天買了兩次同樣的東西），不能因此略過這次的寫入。
+        時間無法判斷時視為是，寧可少寫也不重複。
+        """
+        if event_time is None:
+            return True
+        try:
+            created = datetime.fromisoformat(str(match.get("created_time", "")).replace("Z", "+00:00"))
+        except ValueError:
+            return True
+        if created.tzinfo is None:
+            created = created.replace(tzinfo=timezone.utc)
+        # Notion 的建立時間只精確到分鐘
+        return created >= event_time.replace(second=0, microsecond=0)
 
     @staticmethod
     def _trim(text: str) -> str:
