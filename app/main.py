@@ -7,9 +7,10 @@ import threading
 
 from flask import Flask, abort, jsonify, request
 
+from app.bookkeeper import Bookkeeper
 from app.data_processor import DataProcessor
 from app.line_handler import LineSignatureError, LineWebhookHandler
-from app.notion_client import NotionAccountClient, NotionClientError
+from app.notion_client import NotionAccountClient
 from config.settings import ConfigValidationError, app_config, validate_config
 
 logging.basicConfig(
@@ -30,6 +31,7 @@ app = Flask(__name__)
 line_handler = LineWebhookHandler()
 notion_client = NotionAccountClient()
 data_processor = DataProcessor()
+bookkeeper = Bookkeeper(data_processor, notion_client)
 
 
 # ── 路由 ──────────────────────────────────────────────
@@ -93,12 +95,15 @@ def _process_event(event: dict) -> None:
             _send_status(reply_token)
             return
 
-        entry = data_processor.process_text(text)
-        if not entry.title or entry.amount == 0:
-            line_handler.reply_message(reply_token, _build_parse_failure_message())
-            return
-
-        _write_to_notion_reply(entry, user_name, reply_token)
+        # LINE 在 webhook 逾時後會重送同一則事件；交給 Bookkeeper 判斷是否已記過
+        is_redelivery = bool(event.get("deliveryContext", {}).get("isRedelivery"))
+        # 一則訊息可能拆成多筆、每筆都要查重再寫入，放到背景執行，
+        # 讓 webhook 立刻回 200，LINE 才不會因逾時重送而造成重複記帳。
+        threading.Thread(
+            target=_process_text_async,
+            args=(text, user_name, user_id, reply_token, is_redelivery),
+            daemon=True,
+        ).start()
         return
 
     # ── 圖片訊息（OCR 非同步）────────────
@@ -114,6 +119,27 @@ def _process_event(event: dict) -> None:
         ).start()
 
 
+def _process_text_async(
+    text: str,
+    user_name: str,
+    user_id: str | None,
+    reply_token: str | None,
+    is_redelivery: bool,
+) -> None:
+    """背景執行緒：解析 → 檢核 → 寫 Notion → 回覆。"""
+    try:
+        reply = bookkeeper.handle_text(text, user_name, is_redelivery=is_redelivery)
+    except Exception as exc:  # 背景執行緒的例外不會回到 webhook，這裡要自己回報
+        logger.error("Error handling text message: %s", exc, exc_info=True)
+        reply = "處理這則訊息時發生錯誤，沒有確認是否寫入。請到 Notion 檢查後再重傳。"
+
+    # reply token 約一分鐘失效；處理太久時改用 push 才不會讓使用者收不到結果
+    if reply_token and line_handler.reply_message(reply_token, reply):
+        return
+    if user_id:
+        line_handler.push_message(user_id, reply)
+
+
 def _process_image_async(image_id: str, user_name: str, user_id: str | None) -> None:
     """背景執行緒：下載圖片 → OCR → 寫 Notion → push 確認（優化 ⑧）。"""
     if not user_id:
@@ -126,58 +152,13 @@ def _process_image_async(image_id: str, user_name: str, user_id: str | None) -> 
         return
 
     entry = data_processor.process_image(image_bytes)
-    if entry.amount == 0 and entry.parse_confidence < 0.3:
+    if not entry.is_recordable:
+        # 沒有金額的發票不寫入，避免帳本出現 $0 的紀錄
         logger.warning("OCR failed or no amount detected for image: %s", image_id)
-        line_handler.push_message(user_id, "OCR 辨識失敗，請改用文字輸入或重新拍攝清晰照片。")
+        line_handler.push_message(user_id, "OCR 沒有辨識到金額，沒有記錄。請改用文字輸入或重新拍攝清晰照片。")
         return
 
-    _write_to_notion_push(entry, user_name, user_id)
-
-
-# ── Notion 寫入 ────────────────────────────────────────
-
-def _write_to_notion_reply(entry, user_name: str, reply_token: str) -> None:
-    """文字訊息場景：寫入 Notion 後用 reply_token 回覆。"""
-    try:
-        notion_client.create_account_entry(
-            title=entry.title,
-            amount=entry.amount,
-            entry_type=entry.entry_type,
-            category=entry.category,
-            date=entry.date,
-            vendor=entry.vendor,
-            payment_method=entry.payment_method,
-            description=entry.description,
-            invoice_number=entry.invoice_number,
-            tax_amount=entry.tax_amount,
-            source_user=user_name,
-        )
-        line_handler.reply_message(reply_token, data_processor.format_confirmation(entry))
-    except NotionClientError as exc:
-        line_handler.reply_message(
-            reply_token, f"寫入 Notion 時發生錯誤：{exc}\n請確認資料庫設定。"
-        )
-
-
-def _write_to_notion_push(entry, user_name: str, user_id: str) -> None:
-    """OCR 非同步場景：寫入 Notion 後用 push message 回覆（優化 ⑧）。"""
-    try:
-        notion_client.create_account_entry(
-            title=entry.title,
-            amount=entry.amount,
-            entry_type=entry.entry_type,
-            category=entry.category,
-            date=entry.date,
-            vendor=entry.vendor,
-            payment_method=entry.payment_method,
-            description=entry.description,
-            invoice_number=entry.invoice_number,
-            tax_amount=entry.tax_amount,
-            source_user=user_name,
-        )
-        line_handler.push_message(user_id, data_processor.format_confirmation(entry))
-    except NotionClientError as exc:
-        line_handler.push_message(user_id, f"寫入失敗：{exc}")
+    line_handler.push_message(user_id, bookkeeper.handle_ocr_entry(entry, user_name))
 
 
 # ── 指令回應 ───────────────────────────────────────────
@@ -190,6 +171,11 @@ def _send_help(reply_token: str) -> None:
         "📸 拍照記帳：\n  直接拍發票或收據照片\n\n"
         "📋 結構化輸入：\n  摘要: 講義 | 金額: 4500 | 類型: 支出\n\n"
         "⌨️ 指令格式：\n  /支 數學講義 4500\n  /收 王小明學費 12000\n\n"
+        "🧾 一次多筆：\n  同一則訊息列出多筆，會自動拆開記錄\n\n"
+        "📅 日期與月份：\n  10/4 付 8月勞保 11122 轉帳\n"
+        "  （10/4 是付款日，8 月是歸屬月份；沒寫日期以今天計）\n\n"
+        "↩️ 記錯了：\n  刪除上一筆 - 撤銷您最近記的一筆\n\n"
+        "🧪 試試看不寫入：\n  測試 買講義 500\n\n"
         "🔧 其他指令：\n  /help - 顯示此說明\n  /status - 查看系統狀態"
     )
     line_handler.reply_message(reply_token, help_text)
@@ -198,24 +184,18 @@ def _send_help(reply_token: str) -> None:
 def _send_status(reply_token: str) -> None:
     llm = "已啟用" if data_processor.llm_parser.is_available() else "未設定"
     ocr = "已啟用" if data_processor.ocr_engine.is_available() else "未設定"
+    period = (
+        "已啟用" if notion_client.has_period_property()
+        else f"未建立（在 Notion 新增「{notion_client.period_property}」欄位即可啟用）"
+    )
     status_text = (
         f"✅ {app_config.school_name} 記帳系統\n\n"
         f"🧠 LLM 智慧解析：{llm}\n"
         f"📸 OCR 發票辨識：{ocr}\n"
-        f"🔗 Notion 連線：正常"
+        f"🔗 Notion 連線：正常\n"
+        f"🗓 歸屬月份欄位：{period}"
     )
     line_handler.reply_message(reply_token, status_text)
-
-
-def _build_parse_failure_message() -> str:
-    return (
-        "無法解析金額，請重新輸入。\n\n"
-        "支援格式：\n"
-        "1. 自由輸入：買了 30 本講義 $4500\n"
-        "2. 結構化：摘要: 講義 | 金額: 4500 | 類型: 支出\n"
-        "3. 指令：/支 講義 4500\n"
-        "4. 📸 直接拍發票照片"
-    )
 
 
 if __name__ == "__main__":

@@ -10,7 +10,7 @@
 - **非同步事件處理**：圖片 OCR 處理耗時較長，系統採用背景 Threading 處理，避免 LINE Webhook 發生 504 Timeout。
 - **穩定的 API 重試機制**：對外連線（呼叫 Gemini API）全面實作指數退避重試（Exponential Backoff）。
 - **Fail-Fast 組態驗證**：應用啟動時立即透過 `validate_config()` 確認環境變數是否齊全，提早報錯。
-- **高覆蓋率測試**：內建 58 項單元與整合測試（基於 pytest），涵蓋各種輸入格式、錯誤處理與邊界情境。
+- **高覆蓋率測試**：內建 180 多項單元與整合測試（基於 pytest），涵蓋各種輸入格式、錯誤處理與邊界情境。
 
 ---
 
@@ -35,12 +35,17 @@ LINE-Notion-AccountBook/
 │   ├── ocr_engine.py        # Gemini Vision API 圖片辨識引擎
 │   ├── llm_parser.py        # Gemini API 自然語言記帳解析引擎
 │   ├── data_processor.py    # 雙引擎資料處理器（LLM/OCR/Rule Fallback）
+│   ├── ledger_rules.py      # 資料品質規則（分類、日期/歸屬月份、重複、金額檢核）
+│   ├── bookkeeper.py        # 記帳流程（查重 → 寫入 → 回覆、撤銷、測試模式）
 │   └── notion_client.py     # Notion API 資料庫寫入層（12欄位）
 ├── config/
 │   ├── __init__.py
 │   └── settings.py          # 環境變數設定與驗證模組 (Fail-fast)
 ├── tests/
 │   ├── test_processor.py    # DateProcessor 雙引擎整合測試
+│   ├── test_ledger_rules.py # 資料品質規則測試
+│   ├── test_bookkeeper.py   # 記帳流程測試
+│   ├── test_notion_client.py# Notion 寫入 / 查詢測試
 │   ├── test_llm_parser.py   # LLM 引擎單元測試
 │   └── test_ocr_engine.py   # OCR 引擎單元測試
 ├── docs/                    # 各種文件與設定手冊
@@ -73,7 +78,7 @@ LINE_CHANNEL_SECRET=your_line_secret
 
 # Notion Config
 NOTION_API_KEY=secret_your_notion_key
-NOTION_DATA_SOURCE_ID=your_notion_database_id
+NOTION_DATABASE_ID=your_notion_database_id
 
 # LLM / OCR Engine Config
 GEMINI_API_KEY=your_gemini_api_key
@@ -88,7 +93,7 @@ source .venv/bin/activate
 # 2. 安裝依賴
 pip install -r requirements.txt
 
-# 3. 測試（需 58 項全過）
+# 3. 測試（需全數通過）
 pytest tests/ -v
 
 # 4. 啟動伺服器
@@ -111,7 +116,13 @@ python -m app.main
 4. **快速指令**：
    - `/支 影印紙 500`
    - `/收 張三學費 8000`
-5. **系統輔助指令**：
+5. **一則訊息多筆**：同一則訊息列出多位學生／多張帳單時，會自動拆成多筆寫入；訊息若寫了「總共 $121,500」，會核對各筆加總是否相符。
+6. **日期與歸屬月份**：
+   - `10/4 付 8月勞保 11122 轉帳` → 日期 `10/4`（實際付款日）、歸屬月份 `8 月`。
+   - 訊息沒寫日期時以今天（台灣時間）計，回覆會註明「以今天計」。
+7. **撤銷**：`刪除上一筆`（或 `/undo`）會把您 24 小時內最近記的一筆移到 Notion 垃圾桶。
+8. **測試不寫入**：`測試 買講義 500` 只顯示解析結果，不寫入 Notion。
+9. **系統輔助指令**：
    - `/help` 或 `幫助`：顯示系統操作說明。
    - `/status` 或 `狀態`：查看系統各模組健康狀態（含 LLM 與 OCR 啟用狀態）。
 
@@ -132,3 +143,20 @@ python -m app.main
 - **稅額** (Number)
 - **記錄人** (Rich text)
 - **記錄時間** (Date)
+- **歸屬月份** (Select、Text 或 Date，選填)：建立後 bot 會自動填入 `YYYY-MM`；沒有這個欄位時，歸屬月份與日期不同月的紀錄會改寫在備註開頭（`〔歸屬月份 2026-08〕`）。欄位名稱可用環境變數 `NOTION_PERIOD_PROPERTY` 調整。
+
+> Notion integration 除了「插入內容」，還需要「讀取內容」與「更新內容」權限，重複提醒與「刪除上一筆」才能運作；沒有讀取權限時仍可正常記帳，只是不會提醒重複。
+
+---
+
+## 🛡 寫入前的檢核
+
+| 檢核 | 行為 |
+|---|---|
+| 分類固定規則 | 管理費／房租／水電 → 房租水電；薪資／獎金／勞退 → 人事費用；勞保／健保／稅 → 保險稅務；課程／Workshop → 學費收入 |
+| 分類、付款方式 | 一律收斂到固定清單，不會在 Notion 產生「未知」這類新選項 |
+| 可能重複 | 同日、同金額、同類型且摘要相近時照常寫入，但在回覆中提醒並告知可「刪除上一筆」 |
+| LINE 重送 | 同一則訊息被 LINE 重送且已寫入過時不會再寫一次 |
+| 明細加總 | 薪資等有加減明細的訊息，加總與實付金額不符時提醒；內含代墊款時提醒勿重複記帳 |
+| 修正訊息 | 「請修正…」開頭的訊息不會新增紀錄，會回覆處理方式 |
+| 沒有金額 | 不寫入（含 OCR 沒辨識到金額的發票） |

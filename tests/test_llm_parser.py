@@ -273,3 +273,98 @@ def test_valid_categories_includes_all_types():
                "餐飲點心", "交通費", "廣告行銷", "保險稅務", "其他支出"}
     assert income.issubset(VALID_CATEGORIES)
     assert expense.issubset(VALID_CATEGORIES)
+
+
+# ── 多筆 / 歸屬月份 / 欄位正規化 ──────────────────────
+
+def _parser_returning(monkeypatch, body):
+    monkeypatch.setattr("app.llm_parser.llm_config", _mock_llm_config("test-key"))
+    payload = {"candidates": [{"content": {"parts": [{"text": json.dumps(body, ensure_ascii=False)}]}}]}
+    captured = {}
+
+    def fake_post(*args, **kwargs):
+        captured["payload"] = kwargs.get("json")
+        return DummyResponse(payload)
+
+    monkeypatch.setattr("app.llm_parser.requests.post", fake_post)
+    return LLMParser(), captured
+
+
+def test_parse_multi_returns_every_entry(monkeypatch):
+    parser, _ = _parser_returning(monkeypatch, {
+        "entries": [
+            {"title": "Liam 七月Workshop", "amount": 15300, "type": "收入", "category": "學費收入"},
+            {"title": "Lyanna 七月Workshop", "amount": "15,300", "type": "收入", "category": "學費收入"},
+            {"title": "", "amount": 1},                      # 沒有摘要 → 略過
+        ],
+        "stated_total": 30600,
+    })
+    result = parser.parse_multi("…")
+    assert [e["title"] for e in result["entries"]] == ["Liam 七月Workshop", "Lyanna 七月Workshop"]
+    assert result["entries"][1]["amount"] == 15300.0
+    assert result["stated_total"] == 30600.0
+    assert result["truncated"] is False
+
+
+def test_parse_multi_accepts_bare_list_and_single_object(monkeypatch):
+    parser, _ = _parser_returning(monkeypatch, [{"title": "房租", "amount": 40369}])
+    assert len(parser.parse_multi("房租 40369")["entries"]) == 1
+
+    parser, _ = _parser_returning(monkeypatch, {"title": "房租", "amount": 40369})
+    assert parser.parse("房租 40369")["title"] == "房租"
+
+
+def test_parse_multi_caps_entries(monkeypatch):
+    from app.llm_parser import MAX_ENTRIES_PER_MESSAGE
+
+    many = [{"title": f"項目{i}", "amount": 100} for i in range(MAX_ENTRIES_PER_MESSAGE + 3)]
+    parser, _ = _parser_returning(monkeypatch, {"entries": many})
+    result = parser.parse_multi("…")
+    assert len(result["entries"]) == MAX_ENTRIES_PER_MESSAGE
+    assert result["truncated"] is True
+
+
+def test_request_allows_long_output(monkeypatch):
+    """輸出上限太小會讓薪資明細這類長訊息的 JSON 被截斷，整則退回規則引擎。"""
+    parser, captured = _parser_returning(monkeypatch, {"title": "x", "amount": 1})
+    parser.parse_multi("x 1")
+    assert captured["payload"]["generationConfig"]["maxOutputTokens"] >= 4096
+
+
+def test_validate_result_normalizes_date_period_and_payment(monkeypatch):
+    monkeypatch.setattr("app.llm_parser.llm_config", _mock_llm_config("test-key"))
+    parser = LLMParser()
+    result = parser._validate_result({
+        "title": "8月勞保", "amount": 11122, "type": "支出", "category": "保險稅務",
+        "date": "2026/10/4", "period": "2026-8", "payment_method": "匯款",
+        "vendor": None, "components": [{"label": "a", "amount": "1,000"}, "bad"],
+    })
+    assert result["date"] == "2026-10-04"
+    assert result["period"] == "2026-08"
+    assert result["payment_method"] == "轉帳"
+    assert result["vendor"] == ""
+    assert result["components"] == [{"label": "a", "amount": 1000.0}]
+
+
+@pytest.mark.parametrize("raw, expected", [
+    ("未知", "未指定"),          # OCR 曾回傳「未知」，在 Notion 多出一個選項
+    ("", "未指定"),
+    (None, "未指定"),
+    ("信用卡", "刷卡"),
+    ("line pay", "LINE Pay"),
+    ("現金", "現金"),
+    ("銀行轉帳", "轉帳"),
+])
+def test_normalize_payment_method(raw, expected):
+    from app.llm_parser import normalize_payment_method
+
+    assert normalize_payment_method(raw) == expected
+
+
+def test_validate_result_rejects_bad_date_and_period(monkeypatch):
+    monkeypatch.setattr("app.llm_parser.llm_config", _mock_llm_config("test-key"))
+    parser = LLMParser()
+    result = parser._validate_result({
+        "title": "x", "amount": 1, "date": "上週五", "period": "2026-13",
+    })
+    assert result["date"] is None and result["period"] is None

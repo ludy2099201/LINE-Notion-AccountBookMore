@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import re
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 
 from dotenv import load_dotenv
 
@@ -55,6 +56,8 @@ class NotionConfig:
     api_key: str = os.getenv("NOTION_API_KEY", "")
     database_id: str = normalize_notion_id(os.getenv("NOTION_DATABASE_ID", ""))
     api_version: str = os.getenv("NOTION_API_VERSION", "2022-06-28")
+    # 「歸屬月份」欄位名稱。資料庫有這個欄位才會寫入，沒有則略過。
+    period_property: str = os.getenv("NOTION_PERIOD_PROPERTY", "歸屬月份")
 
 
 @dataclass(frozen=True)
@@ -74,12 +77,28 @@ class AppConfig:
     port: int = _get_int("APP_PORT", 5000)
     debug: bool = _get_bool("APP_DEBUG", False)
     school_name: str = os.getenv("SCHOOL_NAME", "我的補習班")
+    # 記帳日期使用的時區（相對 UTC 的小時數）。台灣為 +8，無日光節約時間。
+    utc_offset_hours: int = _get_int("APP_UTC_OFFSET_HOURS", 8)
 
 
 line_config = LineConfig()
 notion_config = NotionConfig()
 llm_config = LLMConfig()
 app_config = AppConfig()
+
+
+def local_now() -> datetime:
+    """回傳記帳時區（預設台灣 UTC+8）的現在時間。
+
+    伺服器（Railway）以 UTC 執行，直接用 datetime.now() 會讓台灣時間
+    00:00–08:00 之間記的帳落到前一天。
+    """
+    return datetime.now(timezone(timedelta(hours=app_config.utc_offset_hours)))
+
+
+def local_today() -> str:
+    """回傳記帳時區的今天日期（YYYY-MM-DD）。"""
+    return local_now().strftime("%Y-%m-%d")
 
 
 def validate_config() -> bool:
@@ -111,6 +130,11 @@ def validate_config() -> bool:
 
     if not (1 <= app_config.port <= 65535):
         errors.append(f"APP_PORT must be between 1 and 65535, got: {app_config.port}")
+
+    if not (-12 <= app_config.utc_offset_hours <= 14):
+        errors.append(
+            f"APP_UTC_OFFSET_HOURS must be between -12 and 14, got: {app_config.utc_offset_hours}"
+        )
 
     if llm_config.api_key and not llm_config.model:
         errors.append("LLM_MODEL cannot be empty when GEMINI_API_KEY is set")
