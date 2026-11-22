@@ -37,8 +37,12 @@ _CN_MONTHS = {
     "一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6,
     "七": 7, "八": 8, "九": 9, "十": 10, "十一": 11, "十二": 12,
 }
-_PERIOD_DIGIT_RE = re.compile(r"(?<![\d/.\-])(\d{1,2})\s*月(?:份)?(?!\s*\d{1,2}\s*[日號])")
-_PERIOD_CN_RE = re.compile(r"(十[一二]?|[一二三四五六七八九])月")
+# 月份前面可以帶年份：西元（2025年8月）或民國（114年8月）
+_PERIOD_YEAR = r"(?:(?<!\d)(\d{3,4})\s*年\s*)?"
+_PERIOD_DIGIT_RE = re.compile(
+    _PERIOD_YEAR + r"(?<![\d/.\-])(\d{1,2})\s*月(?:份)?(?!\s*\d{1,2}\s*[日號])"
+)
+_PERIOD_CN_RE = re.compile(_PERIOD_YEAR + r"(十[一二]?|[一二三四五六七八九])月")
 
 _ISO_DATE_RE = re.compile(r"(?<!\d)(\d{4})[/-](\d{1,2})[/-](\d{1,2})(?!\d)")
 _MD_SLASH_RE = re.compile(r"(?<![\d/.])(\d{1,2})/(\d{1,2})(?![\d/])")
@@ -104,6 +108,14 @@ def _period_year(month: int, today: date, months_ahead: int) -> int:
     return today.year + (today.month - 1 + offset) // 12
 
 
+def _explicit_year(raw: Optional[str]) -> Optional[int]:
+    """把訊息裡寫的年份轉成西元年；三位數視為民國年。看不懂就回傳 None。"""
+    if not raw:
+        return None
+    year = int(raw) + 1911 if len(raw) == 3 else int(raw)
+    return year if 2000 <= year <= 2100 else None
+
+
 def detect_period(text: str, today: date, entry_type: str = "支出") -> Optional[str]:
     """從文字找出歸屬月份（「8月勞保」「七月Workshop」），回傳 YYYY-MM。
 
@@ -113,15 +125,18 @@ def detect_period(text: str, today: date, entry_type: str = "支出") -> Optiona
         return None
     month = None
     match = _PERIOD_DIGIT_RE.search(text)
-    if match and 1 <= int(match.group(1)) <= 12:
-        month = int(match.group(1))
+    if match and 1 <= int(match.group(2)) <= 12:
+        month = int(match.group(2))
     else:
         match = _PERIOD_CN_RE.search(text)
         if match:
-            month = _CN_MONTHS[match.group(1)]
+            month = _CN_MONTHS[match.group(2)]
     if month is None:
         return None
-    year = _period_year(month, today, PERIOD_MONTHS_AHEAD.get(entry_type, 1))
+    # 訊息寫了年份就照寫的年份，沒寫才用今天推算
+    year = _explicit_year(match.group(1)) or _period_year(
+        month, today, PERIOD_MONTHS_AHEAD.get(entry_type, 1)
+    )
     return f"{year}-{month:02d}"
 
 

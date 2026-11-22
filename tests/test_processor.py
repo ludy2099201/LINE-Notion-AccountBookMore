@@ -343,3 +343,11 @@ def test_format_confirmation_shows_period_and_warnings(processor):
 ])
 def test_command_title_drops_amount_only(rule_processor, text, expected):
     assert rule_processor.process_text(text).title == expected
+
+
+def test_period_keeps_explicit_year(rule_processor):
+    """補記去年的帳：年份不能被換成今年，也不能被當成金額。"""
+    entry = rule_processor.process_text("/支 2025年8月勞保 11122")
+    assert entry.period == "2025-08"
+    assert entry.amount == 11122
+    assert entry.title == "2025年8月勞保"

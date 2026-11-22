@@ -52,6 +52,11 @@ def test_clean_optional_treats_placeholders_as_empty():
     ("12月份房租", TODAY, "支出", "2026-12"),                 # 預付下個月
     ("Liam 七月Workshop", date(2026, 4, 11), "收入", "2026-07"),  # 預收
     ("11月管理費", TODAY, "支出", "2026-11"),
+    ("2025年8月勞保", TODAY, "支出", "2025-08"),              # 寫了年份就照寫的
+    ("2025 年 12 月份房租", TODAY, "支出", "2025-12"),
+    ("114年8月勞保", TODAY, "支出", "2025-08"),               # 民國年
+    ("2027年一月Workshop", TODAY, "收入", "2027-01"),
+    ("9999年8月勞保", TODAY, "支出", "2026-08"),              # 不合理的年份不採用
 ])
 def test_detect_period(text, today, entry_type, expected):
     assert rules.detect_period(text, today, entry_type) == expected
