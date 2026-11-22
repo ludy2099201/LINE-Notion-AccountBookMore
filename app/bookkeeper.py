@@ -34,6 +34,11 @@ PARSE_FAILURE_REPLY = (
     "4. 📸 直接拍發票照片"
 )
 
+UNDO_REDELIVERY_REPLY = (
+    "這則「刪除上一筆」是 LINE 重新送達的，為了避免多刪一筆，這次沒有執行。\n"
+    "請到 Notion 確認；如果剛才那筆還在，請再傳一次「刪除上一筆」。"
+)
+
 
 class Bookkeeper:
     """把一則使用者輸入變成 Notion 上的記帳紀錄，並回傳要回覆的文字。"""
@@ -47,6 +52,9 @@ class Bookkeeper:
     def handle_text(self, text: str, user_name: str, is_redelivery: bool = False) -> str:
         """處理一則文字訊息，回傳要回覆給使用者的文字。"""
         if ledger_rules.is_undo_command(text):
+            if is_redelivery:
+                # 重送的「刪除上一筆」若再執行一次，會連前一筆也刪掉
+                return UNDO_REDELIVERY_REPLY
             return self.undo_last(user_name)
 
         if ledger_rules.is_correction_message(text):

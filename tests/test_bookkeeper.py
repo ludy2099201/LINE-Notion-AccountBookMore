@@ -239,6 +239,14 @@ def test_undo_archives_latest_entry(bookkeeper, notion):
     assert "飲料 $75" in reply
 
 
+def test_redelivered_undo_does_not_delete_again(bookkeeper, notion):
+    """第一次送達已刪掉一筆；重送若再執行會把前一筆也刪掉。"""
+    reply = bookkeeper.handle_text("刪除上一筆", "Mia", is_redelivery=True)
+    notion.find_last_entry_by.assert_not_called()
+    notion.archive_entry.assert_not_called()
+    assert "沒有執行" in reply
+
+
 def test_undo_without_recent_entry_deletes_nothing(bookkeeper, notion):
     notion.find_last_entry_by.return_value = None
     reply = bookkeeper.handle_text("/undo", "Mia")
