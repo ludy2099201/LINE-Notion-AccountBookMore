@@ -101,10 +101,12 @@ def _process_event(event: dict) -> None:
         event_time = _event_time(event)
         # 一則訊息可能拆成多筆、每筆都要查重再寫入，放到背景執行，
         # 讓 webhook 立刻回 200，LINE 才不會因逾時重送而造成重複記帳。
+        # 不能用 daemon 執行緒：已經回了 200，LINE 不會再送一次，
+        # worker 重啟（部署、回收）時要等這則寫完才能結束，否則這筆帳就不見了。
         threading.Thread(
             target=_process_text_async,
             args=(text, user_name, user_id, reply_token, is_redelivery, event_time),
-            daemon=True,
+            daemon=False,
         ).start()
         return
 
